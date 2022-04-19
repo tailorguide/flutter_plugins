@@ -5,10 +5,18 @@
 #import "FLTCam.h"
 #import "FLTCam_Test.h"
 #import "FLTSavePhotoDelegate.h"
-#import "QueueUtils.h"
+#import "QueueHelper.h"
 
 @import CoreMotion;
 #import <libkern/OSAtomic.h>
+
+@interface FLTImageStreamHandler : NSObject <FlutterStreamHandler>
+// The queue on which `eventSink` property should be accessed
+@property(nonatomic, strong) dispatch_queue_t captureSessionQueue;
+// `eventSink` property should be accessed on `captureSessionQueue`.
+// The block itself should be invoked on the main queue.
+@property FlutterEventSink eventSink;
+@end
 
 @implementation FLTImageStreamHandler
 
@@ -44,9 +52,7 @@
 @property(readonly, nonatomic) AVCaptureSession *captureSession;
 
 @property(readonly, nonatomic) AVCaptureInput *captureVideoInput;
-/// Tracks the latest pixel buffer sent from AVFoundation's sample buffer delegate callback.
-/// Used to deliver the latest pixel buffer to the flutter engine via the `copyPixelBuffer` API.
-@property(readwrite, nonatomic) CVPixelBufferRef latestPixelBuffer;
+@property(readonly) CVPixelBufferRef volatile latestPixelBuffer;
 @property(readonly, nonatomic) CGSize captureSize;
 @property(strong, nonatomic) AVAssetWriter *videoWriter;
 @property(strong, nonatomic) AVAssetWriterInput *videoWriterInput;
@@ -60,13 +66,7 @@
 @property(assign, nonatomic) BOOL videoIsDisconnected;
 @property(assign, nonatomic) BOOL audioIsDisconnected;
 @property(assign, nonatomic) BOOL isAudioSetup;
-
-/// Number of frames currently pending processing.
-@property(assign, nonatomic) int streamingPendingFramesCount;
-
-/// Maximum number of frames pending processing.
-@property(assign, nonatomic) int maxStreamingPendingFramesCount;
-
+@property(assign, nonatomic) BOOL isStreamingImages;
 @property(assign, nonatomic) UIDeviceOrientation lockedCaptureOrientation;
 @property(assign, nonatomic) CMTime lastVideoSampleTime;
 @property(assign, nonatomic) CMTime lastAudioSampleTime;
@@ -76,9 +76,6 @@
 @property AVAssetWriterInputPixelBufferAdaptor *videoAdaptor;
 /// All FLTCam's state access and capture session related operations should be on run on this queue.
 @property(strong, nonatomic) dispatch_queue_t captureSessionQueue;
-/// The queue on which `latestPixelBuffer` property is accessed.
-/// To avoid unnecessary contention, do not access `latestPixelBuffer` on the `captureSessionQueue`.
-@property(strong, nonatomic) dispatch_queue_t pixelBufferSynchronizationQueue;
 /// The queue on which captured photos (not videos) are written to disk.
 /// Videos are written to disk by `videoAdaptor` on an internal queue managed by AVFoundation.
 @property(strong, nonatomic) dispatch_queue_t photoIOQueue;
@@ -95,22 +92,6 @@ NSString *const errorMethod = @"error";
                        orientation:(UIDeviceOrientation)orientation
                captureSessionQueue:(dispatch_queue_t)captureSessionQueue
                              error:(NSError **)error {
-  return [self initWithCameraName:cameraName
-                 resolutionPreset:resolutionPreset
-                      enableAudio:enableAudio
-                      orientation:orientation
-                   captureSession:[[AVCaptureSession alloc] init]
-              captureSessionQueue:captureSessionQueue
-                            error:error];
-}
-
-- (instancetype)initWithCameraName:(NSString *)cameraName
-                  resolutionPreset:(NSString *)resolutionPreset
-                       enableAudio:(BOOL)enableAudio
-                       orientation:(UIDeviceOrientation)orientation
-                    captureSession:(AVCaptureSession *)captureSession
-               captureSessionQueue:(dispatch_queue_t)captureSessionQueue
-                             error:(NSError **)error {
   self = [super init];
   NSAssert(self, @"super init cannot be nil");
   @try {
@@ -120,10 +101,8 @@ NSString *const errorMethod = @"error";
   }
   _enableAudio = enableAudio;
   _captureSessionQueue = captureSessionQueue;
-  _pixelBufferSynchronizationQueue =
-      dispatch_queue_create("io.flutter.camera.pixelBufferSynchronizationQueue", NULL);
   _photoIOQueue = dispatch_queue_create("io.flutter.camera.photoIOQueue", NULL);
-  _captureSession = captureSession;
+  _captureSession = [[AVCaptureSession alloc] init];
   _captureDevice = [AVCaptureDevice deviceWithUniqueID:cameraName];
   _flashMode = _captureDevice.hasFlash ? FLTFlashModeAuto : FLTFlashModeOff;
   _exposureMode = FLTExposureModeAuto;
@@ -132,11 +111,6 @@ NSString *const errorMethod = @"error";
   _deviceOrientation = orientation;
   _videoFormat = kCVPixelFormatType_32BGRA;
   _inProgressSavePhotoDelegates = [NSMutableDictionary dictionary];
-
-  // To limit memory consumption, limit the number of frames pending processing.
-  // After some testing, 4 was determined to be the best maximum value.
-  // https://github.com/flutter/plugins/pull/4520#discussion_r766335637
-  _maxStreamingPendingFramesCount = 4;
 
   NSError *localError = nil;
   _captureVideoInput = [AVCaptureDeviceInput deviceInputWithDevice:_captureDevice
@@ -381,17 +355,12 @@ NSString *const errorMethod = @"error";
   if (output == _captureVideoOutput) {
     CVPixelBufferRef newBuffer = CMSampleBufferGetImageBuffer(sampleBuffer);
     CFRetain(newBuffer);
-
-    __block CVPixelBufferRef previousPixelBuffer = nil;
-    // Use `dispatch_sync` to avoid unnecessary context switch under common non-contest scenarios;
-    // Under rare contest scenarios, it will not block for too long since the critical section is
-    // quite lightweight.
-    dispatch_sync(self.pixelBufferSynchronizationQueue, ^{
-      previousPixelBuffer = self.latestPixelBuffer;
-      self.latestPixelBuffer = newBuffer;
-    });
-    if (previousPixelBuffer) {
-      CFRelease(previousPixelBuffer);
+    CVPixelBufferRef old = _latestPixelBuffer;
+    while (!OSAtomicCompareAndSwapPtrBarrier(old, newBuffer, (void **)&_latestPixelBuffer)) {
+      old = _latestPixelBuffer;
+    }
+    if (old != nil) {
+      CFRelease(old);
     }
     if (_onFrameAvailable) {
       _onFrameAvailable();
@@ -404,8 +373,7 @@ NSString *const errorMethod = @"error";
   }
   if (_isStreamingImages) {
     FlutterEventSink eventSink = _imageStreamHandler.eventSink;
-    if (eventSink && (self.streamingPendingFramesCount < self.maxStreamingPendingFramesCount)) {
-      self.streamingPendingFramesCount++;
+    if (eventSink) {
       CVPixelBufferRef pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer);
       // Must lock base address before accessing the pixel data
       CVPixelBufferLockBaseAddress(pixelBuffer, kCVPixelBufferLock_ReadOnly);
@@ -452,7 +420,7 @@ NSString *const errorMethod = @"error";
 
         [planes addObject:planeBuffer];
       }
-      // Lock the base address before accessing pixel data, and unlock it afterwards.
+      // Before accessing pixel data, we should lock the base address, and unlock it afterwards.
       // Done accessing the `pixelBuffer` at this point.
       CVPixelBufferUnlockBaseAddress(pixelBuffer, kCVPixelBufferLock_ReadOnly);
 
@@ -506,35 +474,36 @@ NSString *const errorMethod = @"error";
       CVPixelBufferRef nextBuffer = CMSampleBufferGetImageBuffer(sampleBuffer);
       CMTime nextSampleTime = CMTimeSubtract(_lastVideoSampleTime, _videoTimeOffset);
       [_videoAdaptor appendPixelBuffer:nextBuffer withPresentationTime:nextSampleTime];
-    } else {
-      CMTime dur = CMSampleBufferGetDuration(sampleBuffer);
-
-      if (dur.value > 0) {
-        currentSampleTime = CMTimeAdd(currentSampleTime, dur);
-      }
-
-      if (_audioIsDisconnected) {
-        _audioIsDisconnected = NO;
-
-        if (_audioTimeOffset.value == 0) {
-          _audioTimeOffset = CMTimeSubtract(currentSampleTime, _lastAudioSampleTime);
-        } else {
-          CMTime offset = CMTimeSubtract(currentSampleTime, _lastAudioSampleTime);
-          _audioTimeOffset = CMTimeAdd(_audioTimeOffset, offset);
-        }
-
-        return;
-      }
-
-      _lastAudioSampleTime = currentSampleTime;
-
-      if (_audioTimeOffset.value != 0) {
-        CFRelease(sampleBuffer);
-        sampleBuffer = [self adjustTime:sampleBuffer by:_audioTimeOffset];
-      }
-
-      [self newAudioSample:sampleBuffer];
     }
+    //  else {
+    //   // CMTime dur = CMSampleBufferGetDuration(sampleBuffer);
+
+    //   // if (dur.value > 0) {
+    //   //   currentSampleTime = CMTimeAdd(currentSampleTime, dur);
+    //   // }
+
+    //   // if (_audioIsDisconnected) {
+    //   //   _audioIsDisconnected = NO;
+
+    //   //   if (_audioTimeOffset.value == 0) {
+    //   //     _audioTimeOffset = CMTimeSubtract(currentSampleTime, _lastAudioSampleTime);
+    //   //   } else {
+    //   //     CMTime offset = CMTimeSubtract(currentSampleTime, _lastAudioSampleTime);
+    //   //     _audioTimeOffset = CMTimeAdd(_audioTimeOffset, offset);
+    //   //   }
+
+    //   //   return;
+    //   // }
+
+    //   // _lastAudioSampleTime = currentSampleTime;
+
+    //   // if (_audioTimeOffset.value != 0) {
+    //   //   CFRelease(sampleBuffer);
+    //   //   sampleBuffer = [self adjustTime:sampleBuffer by:_audioTimeOffset];
+    //   // }
+
+    //   // [self newAudioSample:sampleBuffer];
+    // }
 
     CFRelease(sampleBuffer);
   }
@@ -572,22 +541,22 @@ NSString *const errorMethod = @"error";
   }
 }
 
-- (void)newAudioSample:(CMSampleBufferRef)sampleBuffer {
-  if (_videoWriter.status != AVAssetWriterStatusWriting) {
-    if (_videoWriter.status == AVAssetWriterStatusFailed) {
-      [_methodChannel invokeMethod:errorMethod
-                         arguments:[NSString stringWithFormat:@"%@", _videoWriter.error]];
-    }
-    return;
-  }
-  if (_audioWriterInput.readyForMoreMediaData) {
-    if (![_audioWriterInput appendSampleBuffer:sampleBuffer]) {
-      [_methodChannel
-          invokeMethod:errorMethod
-             arguments:[NSString stringWithFormat:@"%@", @"Unable to write to audio input"]];
-    }
-  }
-}
+// - (void)newAudioSample:(CMSampleBufferRef)sampleBuffer {
+//   if (_videoWriter.status != AVAssetWriterStatusWriting) {
+//     if (_videoWriter.status == AVAssetWriterStatusFailed) {
+//       [_methodChannel invokeMethod:errorMethod
+//                          arguments:[NSString stringWithFormat:@"%@", _videoWriter.error]];
+//     }
+//     return;
+//   }
+//   if (_audioWriterInput.readyForMoreMediaData) {
+//     if (![_audioWriterInput appendSampleBuffer:sampleBuffer]) {
+//       [_methodChannel
+//           invokeMethod:errorMethod
+//              arguments:[NSString stringWithFormat:@"%@", @"Unable to write to audio input"]];
+//     }
+//   }
+// }
 
 - (void)close {
   [_captureSession stopRunning];
@@ -607,12 +576,11 @@ NSString *const errorMethod = @"error";
 }
 
 - (CVPixelBufferRef)copyPixelBuffer {
-  __block CVPixelBufferRef pixelBuffer = nil;
-  // Use `dispatch_sync` because `copyPixelBuffer` API requires synchronous return.
-  dispatch_sync(self.pixelBufferSynchronizationQueue, ^{
-    pixelBuffer = self.latestPixelBuffer;
-    self.latestPixelBuffer = nil;
-  });
+  CVPixelBufferRef pixelBuffer = _latestPixelBuffer;
+  while (!OSAtomicCompareAndSwapPtrBarrier(pixelBuffer, nil, (void **)&_latestPixelBuffer)) {
+    pixelBuffer = _latestPixelBuffer;
+  }
+
   return pixelBuffer;
 }
 
@@ -902,13 +870,6 @@ NSString *const errorMethod = @"error";
 }
 
 - (void)startImageStreamWithMessenger:(NSObject<FlutterBinaryMessenger> *)messenger {
-  [self startImageStreamWithMessenger:messenger
-                   imageStreamHandler:[[FLTImageStreamHandler alloc]
-                                          initWithCaptureSessionQueue:_captureSessionQueue]];
-}
-
-- (void)startImageStreamWithMessenger:(NSObject<FlutterBinaryMessenger> *)messenger
-                   imageStreamHandler:(FLTImageStreamHandler *)imageStreamHandler {
   if (!_isStreamingImages) {
     FlutterEventChannel *eventChannel =
         [FlutterEventChannel eventChannelWithName:@"plugins.flutter.io/camera/imageStream"
@@ -916,12 +877,12 @@ NSString *const errorMethod = @"error";
     FLTThreadSafeEventChannel *threadSafeEventChannel =
         [[FLTThreadSafeEventChannel alloc] initWithEventChannel:eventChannel];
 
-    _imageStreamHandler = imageStreamHandler;
+    _imageStreamHandler =
+        [[FLTImageStreamHandler alloc] initWithCaptureSessionQueue:_captureSessionQueue];
     [threadSafeEventChannel setStreamHandler:_imageStreamHandler
                                   completion:^{
                                     dispatch_async(self->_captureSessionQueue, ^{
                                       self.isStreamingImages = YES;
-                                      self.streamingPendingFramesCount = 0;
                                     });
                                   }];
   } else {
@@ -937,10 +898,6 @@ NSString *const errorMethod = @"error";
   } else {
     [_methodChannel invokeMethod:errorMethod arguments:@"Images from camera are not streaming!"];
   }
-}
-
-- (void)receivedImageStreamData {
-  self.streamingPendingFramesCount--;
 }
 
 - (void)getMaxZoomLevelWithResult:(FLTThreadSafeFlutterResult *)result {
@@ -1002,9 +959,11 @@ NSString *const errorMethod = @"error";
   } else {
     return NO;
   }
-  if (_enableAudio && !_isAudioSetup) {
-    [self setUpCaptureSessionForAudio];
-  }
+  // Disabled for the fork:
+
+  // if (_enableAudio && !_isAudioSetup) {
+  //   [self setUpCaptureSessionForAudio];
+  // }
 
   _videoWriter = [[AVAssetWriter alloc] initWithURL:outputURL
                                            fileType:AVFileTypeMPEG4
@@ -1032,23 +991,25 @@ NSString *const errorMethod = @"error";
 
   // Add the audio input
   if (_enableAudio) {
-    AudioChannelLayout acl;
-    bzero(&acl, sizeof(acl));
-    acl.mChannelLayoutTag = kAudioChannelLayoutTag_Mono;
-    NSDictionary *audioOutputSettings = nil;
-    // Both type of audio inputs causes output video file to be corrupted.
-    audioOutputSettings = @{
-      AVFormatIDKey : [NSNumber numberWithInt:kAudioFormatMPEG4AAC],
-      AVSampleRateKey : [NSNumber numberWithFloat:44100.0],
-      AVNumberOfChannelsKey : [NSNumber numberWithInt:1],
-      AVChannelLayoutKey : [NSData dataWithBytes:&acl length:sizeof(acl)],
-    };
-    _audioWriterInput = [AVAssetWriterInput assetWriterInputWithMediaType:AVMediaTypeAudio
-                                                           outputSettings:audioOutputSettings];
-    _audioWriterInput.expectsMediaDataInRealTime = YES;
+    // Disabled in the fork:
 
-    [_videoWriter addInput:_audioWriterInput];
-    [_audioOutput setSampleBufferDelegate:self queue:_captureSessionQueue];
+    // AudioChannelLayout acl;
+    // bzero(&acl, sizeof(acl));
+    // acl.mChannelLayoutTag = kAudioChannelLayoutTag_Mono;
+    // NSDictionary *audioOutputSettings = nil;
+    // // Both type of audio inputs causes output video file to be corrupted.
+    // audioOutputSettings = @{
+    //   AVFormatIDKey : [NSNumber numberWithInt:kAudioFormatMPEG4AAC],
+    //   AVSampleRateKey : [NSNumber numberWithFloat:44100.0],
+    //   AVNumberOfChannelsKey : [NSNumber numberWithInt:1],
+    //   AVChannelLayoutKey : [NSData dataWithBytes:&acl length:sizeof(acl)],
+    // };
+    // _audioWriterInput = [AVAssetWriterInput assetWriterInputWithMediaType:AVMediaTypeAudio
+    //                                                        outputSettings:audioOutputSettings];
+    // _audioWriterInput.expectsMediaDataInRealTime = YES;
+
+    // [_videoWriter addInput:_audioWriterInput];
+    // [_audioOutput setSampleBufferDelegate:self queue:_captureSessionQueue];
   }
 
   if (_flashMode == FLTFlashModeTorch) {
@@ -1064,30 +1025,32 @@ NSString *const errorMethod = @"error";
   return YES;
 }
 
-- (void)setUpCaptureSessionForAudio {
-  NSError *error = nil;
-  // Create a device input with the device and add it to the session.
-  // Setup the audio input.
-  AVCaptureDevice *audioDevice = [AVCaptureDevice defaultDeviceWithMediaType:AVMediaTypeAudio];
-  AVCaptureDeviceInput *audioInput = [AVCaptureDeviceInput deviceInputWithDevice:audioDevice
-                                                                           error:&error];
-  if (error) {
-    [_methodChannel invokeMethod:errorMethod arguments:error.description];
-  }
-  // Setup the audio output.
-  _audioOutput = [[AVCaptureAudioDataOutput alloc] init];
+// Disabled for the fork:
 
-  if ([_captureSession canAddInput:audioInput]) {
-    [_captureSession addInput:audioInput];
+// - (void)setUpCaptureSessionForAudio {
+//   NSError *error = nil;
+//   // Create a device input with the device and add it to the session.
+//   // Setup the audio input.
+//   AVCaptureDevice *audioDevice = [AVCaptureDevice defaultDeviceWithMediaType:AVMediaTypeAudio];
+//   AVCaptureDeviceInput *audioInput = [AVCaptureDeviceInput deviceInputWithDevice:audioDevice
+//                                                                            error:&error];
+//   if (error) {
+//     [_methodChannel invokeMethod:errorMethod arguments:error.description];
+//   }
+//   // Setup the audio output.
+//   _audioOutput = [[AVCaptureAudioDataOutput alloc] init];
 
-    if ([_captureSession canAddOutput:_audioOutput]) {
-      [_captureSession addOutput:_audioOutput];
-      _isAudioSetup = YES;
-    } else {
-      [_methodChannel invokeMethod:errorMethod
-                         arguments:@"Unable to add Audio input/output to session capture"];
-      _isAudioSetup = NO;
-    }
-  }
-}
+//   if ([_captureSession canAddInput:audioInput]) {
+//     [_captureSession addInput:audioInput];
+
+//     if ([_captureSession canAddOutput:_audioOutput]) {
+//       [_captureSession addOutput:_audioOutput];
+//       _isAudioSetup = YES;
+//     } else {
+//       [_methodChannel invokeMethod:errorMethod
+//                          arguments:@"Unable to add Audio input/output to session capture"];
+//       _isAudioSetup = NO;
+//     }
+//   }
+// }
 @end

@@ -4,7 +4,7 @@
 
 #import "FLTThreadSafeFlutterResult.h"
 #import <Foundation/Foundation.h>
-#import "QueueUtils.h"
+#import "QueueHelper.h"
 
 @implementation FLTThreadSafeFlutterResult {
 }
@@ -47,9 +47,9 @@
  * Sends result to flutterResult on the main thread.
  */
 - (void)send:(id _Nullable)result {
-  FLTEnsureToRunOnMainQueue(^{
+  [QueueHelper ensureToRunOnMainQueue:^{
     self.flutterResult(result);
-  });
+  }];
 }
 
 @end
