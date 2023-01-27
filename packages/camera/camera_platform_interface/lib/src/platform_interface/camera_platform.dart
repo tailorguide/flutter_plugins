@@ -65,7 +65,7 @@ abstract class CameraPlatform extends PlatformInterface {
   /// On Android this defaults to ImageFormat.YUV_420_888 and applies only to the imageStream.
   /// On iOS this defaults to kCVPixelFormatType_32BGRA.
   /// On Web this parameter is currently not supported.
-  Future<void> initializeCamera(
+  Future<dynamic> initializeCamera(
     int cameraId, {
     ImageFormatGroup imageFormatGroup = ImageFormatGroup.unknown,
   }) {
@@ -188,6 +188,10 @@ abstract class CameraPlatform extends PlatformInterface {
   /// Returns 0 when the camera supports using a free value without stepping.
   Future<double> getExposureOffsetStepSize(int cameraId) {
     throw UnimplementedError('getMinExposureOffset() is not implemented.');
+  }
+
+  Future<String> getCharacteristics(int cameraId) {
+    throw UnimplementedError('getCharacteristics() is not implemented.');
   }
 
   /// Sets the exposure offset for the selected camera.

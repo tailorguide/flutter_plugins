@@ -16,6 +16,8 @@ import 'package:flutter/services.dart';
 import 'package:flutter/widgets.dart';
 import 'package:stream_transform/stream_transform.dart';
 
+import 'dart:io' show Platform;
+
 const MethodChannel _channel = MethodChannel('plugins.flutter.io/camera');
 
 /// An implementation of [CameraPlatform] that uses method channels.
@@ -102,7 +104,7 @@ class MethodChannelCamera extends CameraPlatform {
   }
 
   @override
-  Future<void> initializeCamera(
+  Future<dynamic> initializeCamera(
     int cameraId, {
     ImageFormatGroup imageFormatGroup = ImageFormatGroup.unknown,
   }) {
@@ -335,6 +337,20 @@ class MethodChannelCamera extends CameraPlatform {
     );
 
     return stepSize!;
+  }
+
+  @override
+  Future<String> getCharacteristics(int cameraId) async {
+    final dynamic characteristics = await _channel.invokeMethod<dynamic>(
+      'getCharacteristics',
+      <String, dynamic>{'cameraId': cameraId},
+    );
+
+    if (Platform.isAndroid) {
+      return characteristics!.toString();
+    } else {
+      return "{\"horizontalFOV\": ${characteristics!.toString()}}";
+    }
   }
 
   @override

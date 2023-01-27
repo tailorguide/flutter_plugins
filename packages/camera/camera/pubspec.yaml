@@ -23,7 +23,7 @@ flutter:
 
 dependencies:
   camera_platform_interface:
-    path: ./camera_platform_interface
+    path: "packages/camera/camera_platform_interface"
 #  camera_web: ^0.2.1
   flutter:
     sdk: flutter
