@@ -23,7 +23,10 @@ flutter:
 
 dependencies:
   camera_platform_interface:
-    path: "packages/camera/camera_platform_interface"
+    git:
+      url: https://github.com/tailorguide/flutter_plugins.git
+      ref: tgmerge
+      path: packages/camera/camera_platform_interface
 #  camera_web: ^0.2.1
   flutter:
     sdk: flutter
