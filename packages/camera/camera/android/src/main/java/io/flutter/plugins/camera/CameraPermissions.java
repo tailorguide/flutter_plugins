@@ -45,7 +45,7 @@ final class CameraPermissions {
       ActivityCompat.requestPermissions(
           activity,
           enableAudio
-              ? new String[] {Manifest.permission.CAMERA, Manifest.permission.RECORD_AUDIO}
+              ? new String[] {Manifest.permission.CAMERA}
               : new String[] {Manifest.permission.CAMERA},
           CAMERA_REQUEST_ID);
     } else {
@@ -60,8 +60,9 @@ final class CameraPermissions {
   }
 
   private boolean hasAudioPermission(Activity activity) {
-    return ContextCompat.checkSelfPermission(activity, permission.RECORD_AUDIO)
-        == PackageManager.PERMISSION_GRANTED;
+//    return ContextCompat.checkSelfPermission(activity, permission.RECORD_AUDIO)
+//        == PackageManager.PERMISSION_GRANTED;
+return true;
   }
 
   @VisibleForTesting

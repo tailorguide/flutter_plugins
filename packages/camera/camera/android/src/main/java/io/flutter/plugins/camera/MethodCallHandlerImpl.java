@@ -73,7 +73,8 @@ final class MethodCallHandlerImpl implements MethodChannel.MethodCallHandler {
           cameraPermissions.requestPermissions(
               activity,
               permissionsRegistry,
-              call.argument("enableAudio"),
+//              call.argument("enableAudio"),
+		false,
               (String errCode, String errDesc) -> {
                 if (errCode == null) {
                   try {
@@ -203,6 +204,15 @@ final class MethodCallHandlerImpl implements MethodChannel.MethodCallHandler {
         {
           try {
             result.success(camera.getExposureOffsetStepSize());
+          } catch (Exception e) {
+            handleException(e, result);
+          }
+          break;
+        }
+      case "getCharacteristics":
+        {
+          try {
+            result.success(camera.getCharacteristics());
           } catch (Exception e) {
             handleException(e, result);
           }

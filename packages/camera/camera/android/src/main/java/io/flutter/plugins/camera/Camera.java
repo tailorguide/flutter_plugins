@@ -34,11 +34,17 @@ import android.os.HandlerThread;
 import android.os.Looper;
 import android.util.Log;
 import android.util.Size;
+import android.util.SizeF;
 import android.view.Display;
 import android.view.Surface;
 import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
 import androidx.annotation.VisibleForTesting;
+
+import org.json.JSONArray;
+import org.json.JSONException;
+import org.json.JSONObject;
+
 import io.flutter.embedding.engine.systemchannels.PlatformChannel;
 import io.flutter.plugin.common.EventChannel;
 import io.flutter.plugin.common.MethodChannel;
@@ -137,11 +143,12 @@ class Camera
 
   private MethodChannel.Result flutterResult;
 
-  /** TG camera hacks */
+  /** TailorGuide camera */
   public Size _sizePreview;   //preview stream size
   public static Size _sizeStill;  //capture size
   public static Size _FallBackSizeStill;  //capture size with possibly lower resolution
   public Size _sizeLargest;   //largest sensor JPEG size
+  public String characteristicsJSONString = "{}";
   Size largest = null;
   Size StillSize = null;
   double _resolutionratio = 100;
@@ -230,7 +237,7 @@ class Camera
   }
 
   @SuppressLint("MissingPermission")
-  public void open(String imageFormatGroup) throws CameraAccessException {
+  public String open(String imageFormatGroup) throws CameraAccessException, JSONException {
 
     CameraManager cameraManager = CameraUtils.getCameraManager(activity);
     CameraCharacteristics characteristics
@@ -238,16 +245,42 @@ class Camera
     StreamConfigurationMap streamConfigurationMap = characteristics.get(
             CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP);
     double SensorAspectRatio = (double) 4 / (double) 3;
+
+
+    // TailorGuide
+    Log.w(TAG, String.valueOf(characteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS));
+    Log.w(TAG, String.valueOf(characteristics.SENSOR_INFO_PHYSICAL_SIZE));
+
+    float focalLength = characteristics.get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)[0];
+    SizeF sensorSize = characteristics.get(CameraCharacteristics.SENSOR_INFO_PHYSICAL_SIZE);
+    double sensorWidth = sensorSize.getWidth();
+    double sensorHeight = sensorSize.getHeight();
+    double horizontalFOV = (2f * Math.atan((sensorWidth / (focalLength * 2f)))) * 180.0 / Math.PI;
+    double verticalFOV = (2f * Math.atan((sensorHeight / (focalLength * 2f)))) * 180.0 / Math.PI;
+    JSONObject characteristicsJSON = new JSONObject();
+    characteristicsJSON.put("focalLength", focalLength);
+    characteristicsJSON.put("sensorSize", sensorSize);
+    characteristicsJSON.put("sensorWidth", sensorWidth);
+    characteristicsJSON.put("sensorHeight", sensorHeight);
+    characteristicsJSON.put("horizontalFOV", horizontalFOV);
+    characteristicsJSON.put("verticalFOV", verticalFOV);
+
     int TargetWidth = 1440;
     // For still image captures, we use the largest available size that does not exceed 720p (1280x720) or 960p on 4:3 (1280:960). (Size limit is for computational efficiency reasons)
     Size[] COMBINEDsizes = streamConfigurationMap.getOutputSizes(ImageFormat.JPEG);        //possible capture sizes
+
+    JSONArray sizes = new JSONArray();
+
     if (COMBINEDsizes.length > 0){
       _resolutionratio = 100;
       double ARatio;
       double ratio;
       for (int _i = 0; _i < (COMBINEDsizes.length); _i++) {
         ARatio = ((double)COMBINEDsizes[_i].getWidth() /(double) COMBINEDsizes[_i].getHeight());
-
+        JSONArray size = new JSONArray();
+        size.put((double)COMBINEDsizes[_i].getWidth());
+        size.put((double)COMBINEDsizes[_i].getHeight());
+        sizes.put(size);
 
         // We are looping from the largest to the smallest, make sure we select the largest that is close to the target
         if(TargetWidth <= COMBINEDsizes[_i].getWidth()) {
@@ -258,12 +291,20 @@ class Camera
         }
       }
     }
+    characteristicsJSON.put("sizes", sizes);
+    characteristicsJSON.put("fallback", false);
 
     //if previous resolution selection methods didn't work, select 1080x1440 and hope for the best
     if (StillSize == null){
       Log.w(TAG, "Resolution fallback to 1440x1080");
       StillSize = new Size(1440, 1080);
+      characteristicsJSON.put("fallback", true);
     }
+    JSONArray selectedSize = new JSONArray();
+    selectedSize.put(StillSize.getWidth());
+    selectedSize.put(StillSize.getHeight());
+    characteristicsJSON.put("selected", selectedSize);
+    characteristicsJSONString = characteristicsJSON.toString();
 
     // Always capture using JPEG format.
     pictureImageReader =
@@ -362,6 +403,7 @@ class Camera
               }
             },
             backgroundHandler);
+    return characteristicsJSON.toString();
   }
 
   private void createCaptureSession(int templateType, Surface... surfaces)
@@ -885,6 +927,12 @@ class Camera
   /** Return the exposure offset step size to dart. */
   public double getExposureOffsetStepSize() {
     return cameraFeatures.getExposureOffset().getExposureOffsetStepSize();
+  }
+
+  /** TailorGuide */
+  /** Return the characteristics of the camera */
+  public String getCharacteristics() {
+    return characteristicsJSONString;
   }
 
   /**

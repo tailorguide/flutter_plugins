@@ -228,7 +228,7 @@ class CameraController extends ValueNotifier<CameraValue> {
   CameraController(
     this.description,
     this.resolutionPreset, {
-    this.enableAudio = true,
+    this.enableAudio = false,
     this.imageFormatGroup,
   }) : super(const CameraValue.uninitialized());
 
@@ -275,7 +275,7 @@ class CameraController extends ValueNotifier<CameraValue> {
   /// Initializes the camera on the device.
   ///
   /// Throws a [CameraException] if the initialization fails.
-  Future<void> initialize() async {
+  Future<dynamic> initialize() async {
     if (_isDisposed) {
       throw CameraException(
         'Disposed CameraController',
@@ -312,6 +312,9 @@ class CameraController extends ValueNotifier<CameraValue> {
         imageFormatGroup: imageFormatGroup ?? ImageFormatGroup.unknown,
       );
 
+      var characteristics =
+          await CameraPlatform.instance.getCharacteristics(_cameraId);
+
       value = value.copyWith(
         isInitialized: true,
         previewSize: await _initializeCompleter.future
@@ -328,6 +331,7 @@ class CameraController extends ValueNotifier<CameraValue> {
         focusPointSupported: await _initializeCompleter.future
             .then((CameraInitializedEvent event) => event.focusPointSupported),
       );
+      return characteristics;
     } on PlatformException catch (e) {
       throw CameraException(e.code, e.message);
     }
@@ -448,13 +452,6 @@ class CameraController extends ValueNotifier<CameraValue> {
     _imageStreamSubscription =
         cameraEventChannel.receiveBroadcastStream().listen(
       (dynamic imageData) {
-        if (defaultTargetPlatform == TargetPlatform.iOS) {
-          try {
-            _channel.invokeMethod<void>('receivedImageStreamData');
-          } on PlatformException catch (e) {
-            throw CameraException(e.code, e.message);
-          }
-        }
         onAvailable(
             CameraImage.fromPlatformData(imageData as Map<dynamic, dynamic>));
       },
@@ -706,6 +703,15 @@ class CameraController extends ValueNotifier<CameraValue> {
     _throwIfNotInitialized('getExposureOffsetStepSize');
     try {
       return CameraPlatform.instance.getExposureOffsetStepSize(_cameraId);
+    } on PlatformException catch (e) {
+      throw CameraException(e.code, e.message);
+    }
+  }
+
+  Future<String> getCharactreristics() async {
+    _throwIfNotInitialized('getCharactreristics');
+    try {
+      return CameraPlatform.instance.getCharacteristics(_cameraId);
     } on PlatformException catch (e) {
       throw CameraException(e.code, e.message);
     }

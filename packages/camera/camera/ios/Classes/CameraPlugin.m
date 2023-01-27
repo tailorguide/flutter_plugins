@@ -239,6 +239,11 @@
       [_camera setExposurePointWithResult:result x:x y:y];
     } else if ([@"getMinExposureOffset" isEqualToString:call.method]) {
       [result sendSuccessWithData:@(_camera.captureDevice.minExposureTargetBias)];
+    } else if ([@"getCharacteristics" isEqualToString:call.method]) {
+        // TailorGuide
+        NSLog(@"getCharacteristics called, we are in objective c, getting videoFieldOfView");
+
+      [result sendSuccessWithData:@(_camera.captureDevice.activeFormat.videoFieldOfView)];
     } else if ([@"getMaxExposureOffset" isEqualToString:call.method]) {
       [result sendSuccessWithData:@(_camera.captureDevice.maxExposureTargetBias)];
     } else if ([@"getExposureOffsetStepSize" isEqualToString:call.method]) {
